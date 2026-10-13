@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../config/auth.php';
+require_once __DIR__ . '/../config/totp.php';
 require_once __DIR__ . '/../partials/nav.php';
 requireLogin('registrar');
 
@@ -8,10 +9,49 @@ $user = currentUser();
 
 $period = '2025-2026-2';
 
-// POST actions
+// ── POST actions ───────────────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
+    // ── AJAX: verify OTP ──────────────────────────────────────────────────
+    if ($action === 'verify_otp') {
+        header('Content-Type: application/json');
+
+        $studentId = (int)($_POST['student_id'] ?? 0);
+        $otpCode   = trim($_POST['otp_code'] ?? '');
+
+        if (!$studentId || !$otpCode) {
+            echo json_encode(['success' => false, 'message' => 'Missing student ID or code.']);
+            exit;
+        }
+
+        // Fetch the student's TOTP secret.
+        $secretStmt = $pdo->prepare("SELECT totp_secret FROM students WHERE id=? LIMIT 1");
+        $secretStmt->execute([$studentId]);
+        $row = $secretStmt->fetch();
+
+        if (!$row || $row['totp_secret'] === null) {
+            echo json_encode(['success' => false, 'message' => 'No verification secret found for this student.']);
+            exit;
+        }
+
+        if (verify_totp_code($row['totp_secret'], $otpCode)) {
+            // Mark the student as serving (they were already called/waiting → serving transition
+            // happened via call_next; this confirms physical presence).
+            $pdo->prepare(
+                "UPDATE enrollment_queue
+                 SET status='serving', called_by=?, called_at=NOW()
+                 WHERE student_id=? AND status='waiting' AND enrollment_period=?"
+            )->execute([$user['id'], $studentId, $period]);
+
+            echo json_encode(['success' => true]);
+        } else {
+            echo json_encode(['success' => false, 'message' => 'Invalid or expired code.']);
+        }
+        exit;
+    }
+
+    // ── add ───────────────────────────────────────────────────────────────
     if ($action === 'add') {
         $studentId = (int)($_POST['student_id'] ?? 0);
         $category  = trim($_POST['category'] ?? 'General Enrollment');
@@ -28,7 +68,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             // Generate queue number: Q + zero-padded count
-            $cnt = (int)$pdo->query("SELECT COUNT(*)+1 FROM enrollment_queue WHERE enrollment_period='$period'")->fetchColumn();
+            $cnt  = (int)$pdo->query("SELECT COUNT(*)+1 FROM enrollment_queue WHERE enrollment_period='$period'")->fetchColumn();
             $qNum = 'Q' . str_pad($cnt, 4, '0', STR_PAD_LEFT);
 
             $pdo->prepare(
@@ -38,6 +78,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirectWith('registrar/queue.php', "Queue number $qNum assigned.");
         }
 
+    // ── call_next ─────────────────────────────────────────────────────────
     } elseif ($action === 'call_next') {
         // Mark current serving as completed first
         $pdo->prepare(
@@ -45,23 +86,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
              WHERE status='serving' AND enrollment_period=?"
         )->execute([$period]);
 
-        // Call next waiting
+        // Call next waiting — leave status as 'waiting' so OTP verification
+        // is required before the registrar can proceed. The verify_otp action
+        // transitions them to 'serving' after the code is confirmed.
         $next = $pdo->prepare(
-            "SELECT id FROM enrollment_queue
+            "SELECT id, student_id FROM enrollment_queue
              WHERE status='waiting' AND enrollment_period=?
              ORDER BY created_at ASC LIMIT 1"
         );
         $next->execute([$period]);
         $nextRow = $next->fetch();
+
         if ($nextRow) {
+            // Record who called them and when, but keep status='waiting' until OTP confirmed.
             $pdo->prepare(
-                "UPDATE enrollment_queue SET status='serving', called_by=?, called_at=NOW() WHERE id=?"
+                "UPDATE enrollment_queue SET called_by=?, called_at=NOW() WHERE id=?"
             )->execute([$user['id'], $nextRow['id']]);
-            redirectWith('registrar/queue.php', 'Next student called.');
+            redirectWith('registrar/queue.php', 'Next student called — verify their OTP code to confirm presence.');
         } else {
             redirectWith('registrar/queue.php', 'No more students in the queue.', 'error');
         }
 
+    // ── skip ─────────────────────────────────────────────────────────────
     } elseif ($action === 'skip') {
         $qid = (int)($_POST['queue_id'] ?? 0);
         if ($qid) {
@@ -69,6 +115,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             redirectWith('registrar/queue.php', 'Student skipped.');
         }
 
+    // ── complete ──────────────────────────────────────────────────────────
     } elseif ($action === 'complete') {
         $qid = (int)($_POST['queue_id'] ?? 0);
         if ($qid) {
@@ -78,9 +125,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Load queue
+// ── Load queue ─────────────────────────────────────────────────────────────
 $currentlyServing = $pdo->prepare(
-    "SELECT eq.*, s.student_number, u.full_name
+    "SELECT eq.*, s.student_number, s.id AS student_db_id, u.full_name
      FROM enrollment_queue eq
      JOIN students s ON s.id = eq.student_id
      JOIN users u    ON u.id = s.user_id
@@ -90,12 +137,24 @@ $currentlyServing = $pdo->prepare(
 $currentlyServing->execute([$period]);
 $serving = $currentlyServing->fetch();
 
+// Called but not yet OTP-verified (status still 'waiting' and called_at is set)
+$calledStudent = $pdo->prepare(
+    "SELECT eq.*, s.student_number, s.id AS student_db_id, u.full_name
+     FROM enrollment_queue eq
+     JOIN students s ON s.id = eq.student_id
+     JOIN users u    ON u.id = s.user_id
+     WHERE eq.status='waiting' AND eq.called_at IS NOT NULL AND eq.enrollment_period=?
+     ORDER BY eq.called_at DESC LIMIT 1"
+);
+$calledStudent->execute([$period]);
+$called = $calledStudent->fetch();
+
 $waitingList = $pdo->prepare(
     "SELECT eq.*, s.student_number, u.full_name
      FROM enrollment_queue eq
      JOIN students s ON s.id = eq.student_id
      JOIN users u    ON u.id = s.user_id
-     WHERE eq.status='waiting' AND eq.enrollment_period=?
+     WHERE eq.status='waiting' AND eq.called_at IS NULL AND eq.enrollment_period=?
      ORDER BY eq.created_at ASC"
 );
 $waitingList->execute([$period]);
@@ -116,7 +175,9 @@ $allStudents = $pdo->query(
      ORDER BY u.full_name"
 )->fetchAll();
 
-$navItems = getNavItems('registrar', 'Queue');
+$totalWaiting = count($waiting) + ($called ? 1 : 0);
+
+$navItems   = getNavItems('registrar', 'Queue');
 $pageTitle  = 'Enrollment Queue — Horizon Academy';
 $topbarUser = ['name' => $user['full_name'], 'role' => 'Registrar'];
 include __DIR__ . '/../partials/layout_start.php';
@@ -131,7 +192,7 @@ include __DIR__ . '/../partials/layout_start.php';
     <span style="font-size:2rem;opacity:.5;">🔔</span>
   </div>
   <div class="stat-card">
-    <div><div class="stat-label">Waiting</div><div class="stat-num" style="color:var(--gold);"><?= count($waiting) ?></div></div>
+    <div><div class="stat-label">Waiting</div><div class="stat-num" style="color:var(--gold);"><?= $totalWaiting ?></div></div>
     <span style="font-size:2rem;opacity:.5;">⏳</span>
   </div>
   <div class="stat-card">
@@ -170,18 +231,56 @@ include __DIR__ . '/../partials/layout_start.php';
       <?php endif; ?>
     </div>
 
+    <!-- ── OTP Verification Panel (shown when a student has been called but not yet verified) -->
+    <?php if ($called): ?>
+    <div class="panel mb-16" style="border:2px solid var(--gold);">
+      <div class="panel-header" style="background:var(--gold);color:#fff;">🔐 Verify Student Presence</div>
+      <div style="padding:20px;text-align:center;">
+        <div style="font-size:.92rem;color:var(--text-mid);margin-bottom:4px;">
+          Called: <strong><?= htmlspecialchars($called['full_name']) ?></strong>
+          (<?= htmlspecialchars($called['student_number']) ?>) — <?= htmlspecialchars($called['queue_number']) ?>
+        </div>
+        <div style="font-size:.82rem;color:var(--text-light);margin-bottom:16px;">
+          Ask the student to show their 6-digit code from the student portal.
+        </div>
+        <div style="display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap;">
+          <input
+            type="text"
+            id="otp-input"
+            inputmode="numeric"
+            pattern="\d{6}"
+            maxlength="6"
+            placeholder="000000"
+            autocomplete="one-time-code"
+            style="font-family:'Caveat',cursive;font-size:2rem;font-weight:700;letter-spacing:0.2em;
+                   width:160px;text-align:center;padding:10px 14px;border:2px solid var(--border);
+                   border-radius:var(--radius-sm);background:var(--bg-secondary);color:var(--text-dark);"
+          >
+          <button
+            type="button"
+            id="otp-verify-btn"
+            class="btn-submit"
+            style="padding:10px 24px;font-size:.92rem;"
+            onclick="verifyOtp(<?= (int)$called['student_db_id'] ?>)"
+          >Verify</button>
+        </div>
+        <div id="otp-result" style="margin-top:14px;font-size:.88rem;font-weight:600;min-height:22px;"></div>
+      </div>
+    </div>
+    <?php endif; ?>
+
     <!-- Call Next -->
     <form method="POST" style="margin-bottom:16px;">
       <input type="hidden" name="action" value="call_next">
-      <button type="submit" class="btn-submit btn-teal" style="font-size:1rem;padding:16px;">
+      <button type="submit" class="btn-submit btn-teal" style="font-size:1rem;padding:16px;"
+        <?= $called ? 'disabled title="Verify the current student before calling the next one."' : '' ?>>
         🔔 Call Next Student
       </button>
     </form>
   </div>
 
-  <!-- Right panel: Add to queue + waiting list -->
+  <!-- Right panel: Add to queue -->
   <div>
-    <!-- Add student to queue -->
     <div class="panel" style="margin-bottom:16px;">
       <div class="panel-header">Add Student to Queue</div>
       <form method="POST" style="padding:16px;">
@@ -212,16 +311,28 @@ include __DIR__ . '/../partials/layout_start.php';
 
 <!-- Waiting List -->
 <div class="panel">
-  <div class="panel-header">Waiting List (<?= count($waiting) ?>)</div>
+  <div class="panel-header">Waiting List (<?= $totalWaiting ?>)</div>
   <table class="data-table">
     <thead>
       <tr><th>#</th><th>Queue No.</th><th>Student</th><th>Category</th><th>Waiting Since</th><th>Action</th></tr>
     </thead>
     <tbody>
-      <?php foreach ($waiting as $i => $q): ?>
-      <tr>
-        <td><?= $i+1 ?></td>
-        <td><strong style="color:var(--accent-dark);font-family:'Caveat',cursive;font-size:1.2rem;"><?= htmlspecialchars($q['queue_number']) ?></strong></td>
+      <?php
+      // Show the called-but-unverified student at the top of the list (highlighted)
+      $displayWaiting = $called ? array_merge([$called], $waiting) : $waiting;
+      foreach ($displayWaiting as $i => $q):
+        $isCalled = $called && $q['id'] === $called['id'];
+      ?>
+      <tr <?= $isCalled ? 'style="background:rgba(200,160,0,.08);"' : '' ?>>
+        <td><?= $i + 1 ?></td>
+        <td>
+          <strong style="color:var(--accent-dark);font-family:'Caveat',cursive;font-size:1.2rem;">
+            <?= htmlspecialchars($q['queue_number']) ?>
+          </strong>
+          <?php if ($isCalled): ?>
+            <span class="badge badge-gold" style="font-size:.68rem;margin-left:4px;">Called</span>
+          <?php endif; ?>
+        </td>
         <td><?= htmlspecialchars($q['full_name']) ?><br><small class="text-muted"><?= htmlspecialchars($q['student_number']) ?></small></td>
         <td><?= htmlspecialchars($q['category']) ?></td>
         <td><?= date('h:i A', strtotime($q['created_at'])) ?></td>
@@ -234,11 +345,67 @@ include __DIR__ . '/../partials/layout_start.php';
         </td>
       </tr>
       <?php endforeach; ?>
-      <?php if (empty($waiting)): ?>
+      <?php if (empty($displayWaiting)): ?>
       <tr><td colspan="6" class="text-center text-muted" style="padding:20px;">No students in the waiting queue.</td></tr>
       <?php endif; ?>
     </tbody>
   </table>
 </div>
+
+<script>
+function verifyOtp(studentId) {
+  const input  = document.getElementById('otp-input');
+  const result = document.getElementById('otp-result');
+  const btn    = document.getElementById('otp-verify-btn');
+  const code   = input.value.trim();
+
+  if (!/^\d{6}$/.test(code)) {
+    result.textContent = '⚠️ Please enter a valid 6-digit code.';
+    result.style.color = 'var(--red, #c0392b)';
+    return;
+  }
+
+  btn.disabled       = true;
+  result.textContent = 'Verifying…';
+  result.style.color = 'var(--text-light)';
+
+  const body = new URLSearchParams({
+    action:     'verify_otp',
+    student_id: studentId,
+    otp_code:   code
+  });
+
+  fetch(window.location.href, { method: 'POST', body })
+    .then(r => r.json())
+    .then(data => {
+      if (data.success) {
+        result.textContent = '✅ Code verified — student confirmed present.';
+        result.style.color = 'var(--green, #27ae60)';
+        // Reload after a short delay so the serving panel updates.
+        setTimeout(() => location.reload(), 1200);
+      } else {
+        result.textContent = '❌ ' + (data.message || 'Invalid or expired code.');
+        result.style.color = 'var(--red, #c0392b)';
+        btn.disabled = false;
+        input.focus();
+      }
+    })
+    .catch(() => {
+      result.textContent = '❌ Network error — please try again.';
+      result.style.color = 'var(--red, #c0392b)';
+      btn.disabled = false;
+    });
+}
+
+// Allow Enter key to trigger verification from the OTP input.
+document.addEventListener('DOMContentLoaded', function () {
+  const input = document.getElementById('otp-input');
+  if (input) {
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') verifyOtp(<?= $called ? (int)$called['student_db_id'] : 'null' ?>);
+    });
+  }
+});
+</script>
 
 <?php include __DIR__ . '/../partials/layout_end.php'; ?>
