@@ -22,3 +22,8 @@ php_errors.log
 # Composer (not used, but just in case)
 vendor/
 composer.lock
+
+# Database setup files — import locally, do not deploy
+schema.sql
+migration.sql
+seed_passwords.php
