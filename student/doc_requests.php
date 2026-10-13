@@ -1,7 +1,18 @@
 <?php
+/**
+ * ═══════════════════════════════════════════════════════════
+ * STUDENT DOCUMENT REQUESTS — student/doc_requests.php
+ * ═══════════════════════════════════════════════════════════
+ * Rate limiting: max 5 document-request submissions per student
+ * per 60-minute rolling window (session-backed).
+ */
 require_once __DIR__ . '/../config/auth.php';
 require_once __DIR__ . '/../partials/nav.php';
 requireLogin('student');
+
+// ── Rate-limiting constants ────────────────────────────────
+const DOC_REQ_RATE_MAX    = 5;    // max submissions in the window
+const DOC_REQ_RATE_WINDOW = 3600; // 60 minutes in seconds
 
 $pdo  = getDB();
 $user = currentUser();
@@ -13,6 +24,32 @@ if (!$sid) {
 
 // Handle new request submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // ── Rate-limit check ──────────────────────────────────
+    // Use a per-student session bucket keyed by their DB id so
+    // students sharing a browser can't reset each other's counters.
+    $bucketKey   = 'rl_docreq_' . $sid;
+    $bucketTsKey = 'rl_docreq_ts_' . $sid;
+
+    // Reset the bucket if it doesn't exist or the window has expired.
+    if (
+        !isset($_SESSION[$bucketKey]) ||
+        (time() - ($_SESSION[$bucketTsKey] ?? 0)) > DOC_REQ_RATE_WINDOW
+    ) {
+        $_SESSION[$bucketKey]   = 0;
+        $_SESSION[$bucketTsKey] = time();
+    }
+
+    $_SESSION[$bucketKey]++;
+
+    if ($_SESSION[$bucketKey] > DOC_REQ_RATE_MAX) {
+        $remaining = DOC_REQ_RATE_WINDOW - (time() - $_SESSION[$bucketTsKey]);
+        $minutes   = (int)ceil($remaining / 60);
+        redirectWith(
+            'student/doc_requests.php',
+            "Too many requests submitted. Please wait {$minutes} minute(s) before submitting again.",
+            'error'
+        );
+    }
     $docTypeId = (int)($_POST['document_type_id'] ?? 0);
     $purpose   = trim($_POST['purpose'] ?? '');
     $copies    = max(1, (int)($_POST['copies'] ?? 1));
