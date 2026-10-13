@@ -6,7 +6,6 @@
 //   2. Add config/db.php to .gitignore
 //   3. Never commit real production passwords to version control
 
-<?php
 /**
  * ═══════════════════════════════════════════════════════════
  * DATABASE CONFIGURATION & CONNECTION
