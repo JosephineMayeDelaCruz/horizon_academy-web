@@ -68,7 +68,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             // Generate queue number: Q + zero-padded count
-            $cnt  = (int)$pdo->query("SELECT COUNT(*)+1 FROM enrollment_queue WHERE enrollment_period='$period'")->fetchColumn();
+            $cntStmt = $pdo->prepare("SELECT COUNT(*)+1 FROM enrollment_queue WHERE enrollment_period=?");
+            $cntStmt->execute([$period]);
+            $cnt  = (int)$cntStmt->fetchColumn();
             $qNum = 'Q' . str_pad($cnt, 4, '0', STR_PAD_LEFT);
 
             $pdo->prepare(
