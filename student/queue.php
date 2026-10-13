@@ -113,6 +113,23 @@ include __DIR__ . '/../partials/layout_start.php';
           Added <?= date('h:i A', strtotime($myEntry['created_at'])) ?>
         </div>
 
+        <?php if (!empty($myEntry['called_at'])): ?>
+        <!-- ── TOTP Presence Verification (called, awaiting OTP) ── -->
+        <div style="margin-top:24px;padding:20px;background:var(--bg-secondary);border-radius:var(--radius);border:2px solid var(--gold);">
+          <div class="stat-label" style="margin-bottom:8px;">YOUR VERIFICATION CODE</div>
+          <div style="font-family:'Caveat',cursive;font-size:4.5rem;font-weight:700;color:var(--gold);letter-spacing:0.15em;line-height:1;">
+            <?= htmlspecialchars(get_totp_code($totpSecret)) ?>
+          </div>
+          <div style="font-size:.82rem;color:var(--text-light);margin-top:8px;">
+            🔄 This code refreshes every 30 seconds
+          </div>
+          <div style="margin-top:12px;padding:8px 14px;background:#fff3cd;border:1px solid #ffc107;border-radius:var(--radius-sm);font-size:.82rem;color:#856404;font-weight:600;">
+            ⚠️ Do not share this code with anyone
+          </div>
+        </div>
+        <!-- ── end TOTP ──────────────────────────────────────── -->
+        <?php endif; ?>
+
       <?php elseif ($myEntry['status'] === 'serving'): ?>
         <div style="font-family:'Caveat',cursive;font-size:4rem;font-weight:700;color:var(--green);">
           <?= htmlspecialchars($myEntry['queue_number']) ?>
