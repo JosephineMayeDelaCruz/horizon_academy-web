@@ -1,4 +1,12 @@
 <?php
+// ⚠️  SECURITY NOTICE:
+// This file contains database credentials.
+// Before deploying to a production server:
+//   1. Replace credentials with environment variables or a secrets manager
+//   2. Add config/db.php to .gitignore
+//   3. Never commit real production passwords to version control
+
+<?php
 /**
  * ═══════════════════════════════════════════════════════════
  * DATABASE CONFIGURATION & CONNECTION
