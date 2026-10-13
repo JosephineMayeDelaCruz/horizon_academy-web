@@ -59,7 +59,10 @@ $wStmt->execute([$period]);
 $totalWaiting = (int)$wStmt->fetchColumn();
 
 // Is this student currently being served? Pre-compute for the view.
-$isServing = $myEntry && $myEntry['status'] === 'serving';
+$isServing = $myEntry && (
+    $myEntry['status'] === 'serving' ||
+    ($myEntry['status'] === 'waiting' && !empty($myEntry['called_at']))
+);
 
 $navItems   = getNavItems('student', 'Queue');
 $pageTitle  = 'Enrollment Queue — Horizon Academy';
