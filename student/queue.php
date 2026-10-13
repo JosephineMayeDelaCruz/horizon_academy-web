@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../config/auth.php';
+require_once __DIR__ . '/../config/totp.php';
 require_once __DIR__ . '/../partials/nav.php';
 requireLogin('student');
 
@@ -9,14 +10,24 @@ $sid  = (int)($user['student_db_id'] ?? 0);
 
 $period = '2025-2026-2';
 
-// Student's own queue entry
+// Student's own queue entry (join students to get totp_secret)
 $myQueue = $pdo->prepare(
-    "SELECT * FROM enrollment_queue
-     WHERE student_id=? AND enrollment_period=?
-     ORDER BY created_at DESC LIMIT 1"
+    "SELECT eq.*, s.totp_secret
+     FROM enrollment_queue eq
+     JOIN students s ON s.id = eq.student_id
+     WHERE eq.student_id=? AND eq.enrollment_period=?
+     ORDER BY eq.created_at DESC LIMIT 1"
 );
 $myQueue->execute([$sid, $period]);
 $myEntry = $myQueue->fetch();
+
+// If the student has no TOTP secret yet, generate and persist one now.
+$totpSecret = $myEntry['totp_secret'] ?? null;
+if ($totpSecret === null) {
+    $totpSecret = generate_totp_secret();
+    $pdo->prepare("UPDATE students SET totp_secret=? WHERE id=?")
+        ->execute([$totpSecret, $sid]);
+}
 
 // Currently serving
 $serving = $pdo->prepare(
@@ -43,20 +54,23 @@ if ($myEntry && $myEntry['status'] === 'waiting') {
 }
 
 // Total waiting
-$totalWaiting = (int)$pdo->prepare(
-    "SELECT COUNT(*) FROM enrollment_queue WHERE status='waiting' AND enrollment_period=?"
-)->execute([$period]) ? $pdo->prepare(
-    "SELECT COUNT(*) FROM enrollment_queue WHERE status='waiting' AND enrollment_period=?"
-) : null;
 $wStmt = $pdo->prepare("SELECT COUNT(*) FROM enrollment_queue WHERE status='waiting' AND enrollment_period=?");
 $wStmt->execute([$period]);
 $totalWaiting = (int)$wStmt->fetchColumn();
 
-$navItems = getNavItems('student', 'Queue');
+// Is this student currently being served? Pre-compute for the view.
+$isServing = $myEntry && $myEntry['status'] === 'serving';
+
+$navItems   = getNavItems('student', 'Queue');
 $pageTitle  = 'Enrollment Queue — Horizon Academy';
 $topbarUser = ['name' => $user['full_name'], 'role' => 'Student'];
 include __DIR__ . '/../partials/layout_start.php';
 ?>
+
+<?php if ($isServing): ?>
+<!-- Auto-reload every 30 seconds while being served so the OTP code stays current. -->
+<script>setTimeout(function(){ location.reload(); }, 30000);</script>
+<?php endif; ?>
 
 <div class="content-title">Enrollment Queue</div>
 
@@ -104,6 +118,21 @@ include __DIR__ . '/../partials/layout_start.php';
         <div style="margin-top:14px;font-size:.92rem;color:var(--green);font-weight:700;">
           🔔 Please proceed to the enrollment window.
         </div>
+
+        <!-- ── TOTP Presence Verification ─────────────────────── -->
+        <div style="margin-top:24px;padding:20px;background:var(--bg-secondary);border-radius:var(--radius);border:2px solid var(--green);">
+          <div class="stat-label" style="margin-bottom:8px;">YOUR VERIFICATION CODE</div>
+          <div style="font-family:'Caveat',cursive;font-size:4.5rem;font-weight:700;color:var(--green);letter-spacing:0.15em;line-height:1;">
+            <?= htmlspecialchars(get_totp_code($totpSecret)) ?>
+          </div>
+          <div style="font-size:.82rem;color:var(--text-light);margin-top:8px;">
+            🔄 This code refreshes every 30 seconds
+          </div>
+          <div style="margin-top:12px;padding:8px 14px;background:#fff3cd;border:1px solid #ffc107;border-radius:var(--radius-sm);font-size:.82rem;color:#856404;font-weight:600;">
+            ⚠️ Do not share this code with anyone
+          </div>
+        </div>
+        <!-- ── end TOTP ──────────────────────────────────────── -->
 
       <?php elseif ($myEntry['status'] === 'completed'): ?>
         <div style="font-size:3rem;margin-bottom:8px;">✅</div>
